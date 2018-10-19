@@ -1,0 +1,79 @@
+---
+- name: Ensure Docker is installed
+  hosts: all
+  remote_user: ec2-user
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Install Docker
+      yum: name=docker
+
+    - name: Ensure docker service is started and enabled
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Create directory for Portainer
+      file:
+        path: .portainer/data
+        state: directory
+        owner: ec2-user
+        group: ec2-user
+
+- name: Initialize Swarm Mode
+  hosts: manager-leader
+  remote_user: ec2-user
+  gather_facts: false
+  become: true
+  tasks:
+    - shell: "docker info | grep 'Swarm' | awk -F'Swarm: ' '{print $NF}'"
+      register: swarm_mode
+
+    - name: Swarm init
+      command: docker swarm init --advertise-addr {{ private_ip }}
+      when: swarm_mode.stdout == "inactive"
+
+    - name: Master token
+      command: docker swarm join-token manager -q
+      when: swarm_mode.stdout == "active"
+      register: master_token
+
+    - shell: "docker network ls | grep service -c | { grep -v grep || true; }"
+      register: overlay_network_created
+
+    - name: Create service overlay network
+      command: docker network create --driver overlay --subnet 10.0.0.0/16 service
+      when: overlay_network_created.stdout == "0"
+
+    - shell: "docker service ls | grep -i portainer | wc -l"
+      register: portainer_started
+
+    - name: Create Portainer Service
+      command: docker service create --detach=false --name portainer --publish 9000:9000
+        --constraint 'node.role == manager' --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock
+        --mount type=bind,src=/home/ec2-user/.portainer/data,dst=/data portainer/portainer
+      when: portainer_started.stdout == "0"
+
+- name: Join Swarm Cluster
+  hosts: manager-follower
+  remote_user: ec2-user
+  gather_facts: false
+  become: true
+  vars:
+    token: "{{ hostvars[groups['manager-leader'][0]]['master_token']['stdout'] }}"
+    master: "{{ hostvars[groups['manager-leader'][0]]['private_ip'] }}"
+  tasks:
+    - shell: "docker info | grep 'Swarm' | awk -F'Swarm: ' '{print $NF}'"
+      register: swarm_mode
+
+    - name: Join swarm cluster as manager
+      command: docker swarm join --token {{ token }} {{ master }}:2377
+      when: swarm_mode.stdout == "inactive"
+      register: follower
+
+    - name: Show join cluster resusts
+      debug: var=follower.stdout
+
+    - name: Show join cluster errors
+      debug: var=follower.stderr
